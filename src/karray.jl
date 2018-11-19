@@ -1,3 +1,4 @@
+using CUDAnative
 """
 
     KnetArray{T}(undef,dims)
@@ -251,72 +252,61 @@ end; end
 # vcat(m,m): I = (1:3,Colon()) I = (4:6,Colon())
 
 # based on typed_hcat{T}(::Type{T}, A::AbstractVecOrMat...) in base/abstractarray.jl:996
-function hcat(A::KnetVecOrMat{T}...) where {T}
-    nargs = length(A)
-    nrows = size(A[1], 1)
-    ncols = 0
-    for j = 1:nargs
-        Aj = A[j]
-        if size(Aj, 1) != nrows
-            throw(ArgumentError("number of rows of each array must match (got $(map(x->size(x,1), A)))"))
-        end
-        nd = ndims(Aj)
-        ncols += (nd==2 ? size(Aj,2) : 1)
-    end
-    B = similar(A[1], nrows, ncols)
-    pos = 1
-    for k = 1:nargs
-        Ak = A[k]
-        n = length(Ak)
-        copyto!(B, pos, Ak, 1, n)
-        pos += n
-    end
-    return B
+
+@generated function nindex(i::T, ls::NTuple{N,T}) where {N,T}
+  na = one(i)
+  quote
+    Base.@_inline_meta
+    $(foldr((n, els) -> :(i ≤ ls[$n] ? ($n, i) : (i -= ls[$n]; $els)), :($na, $na), one(i):i(N)))
+  end
 end
 
-function vcat(A::KnetVector{T}...) where {T}
-    nargs = length(A)
-    nrows = 0
-    for a in A
-        nrows += length(a)
-    end
-    B = similar(A[1], nrows)
-    pos = 1
-    for k = 1:nargs
-        Ak = A[k]
-        n = length(Ak)
-        copyto!(B, pos, Ak, 1, n)
-        pos += n
-    end
-    return B
+@inline function catindex(dim, I::NTuple{N}, shapes) where N
+  @inbounds x, i = nindex(I[dim], getindex.(shapes, dim))
+  x, ntuple(n -> n == dim ? i : I[n], Val{N})
 end
 
-function vcat(A::KnetVecOrMat{T}...) where {T}
-    nargs = length(A)
-    nrows = sum(a->size(a, 1), A)::Int
-    ncols = size(A[1], 2)
-    for j = 2:nargs
-        if size(A[j], 2) != ncols
-            throw(ArgumentError("number of columns of each array must match (got $(map(x->size(x,2), A)))"))
-        end
-    end
-    B = similar(A[1], nrows, ncols)
-    pos = 1
-    for k = 1:nargs
-        Ak = A[k]
-        p1 = pos+size(Ak,1)-1
-        B[pos:p1, :] = Ak
-        pos = p1+1
-    end
-    return B
+function growdims(dim, x)
+  if ndims(x) >= dim
+    x
+  else
+    reshape(x, size.((x,), 1:dim)...)
+  end
 end
 
-function cat(a1::KnetVecOrMat{T}, a::KnetVecOrMat{T}...; dims) where {T}
-    if     dims==1 || dims==Val(1); vcat(a1, a...)
-    elseif dims==2 || dims==Val(2); hcat(a1, a...)
-    else error("cat(a...;dims=$dims) not implemented.")
-    end
+function cudims(n::Integer)
+  threads = min(n, 256)
+  ceil(Int, n / threads), threads
 end
+
+cudims(a::AbstractArray) = cudims(length(a))
+
+@inline ind2sub_(a::AbstractArray{T,0}, i) where T = ()
+@inline ind2sub_(a, i) = Tuple(CartesianIndices(a)[i])
+function _cat(dim, dest, xs...)
+  function kernel(dim, dest, xs)
+    i = (blockIdx().x-1) * blockDim().x + threadIdx().x
+    i > length(A) && return
+    I = ind2sub_(A, i)
+    @inbounds n, I′ = catindex(dim, Int.(I), size.(xs))
+    @inbounds dest[I...] = xs[n][I′...]
+    return
+  end
+  xs = growdims.(dim, xs)
+  blk, thr = cudims(dest)
+  @cuda blocks=blk threads=thr kernel(dim, dest, xs)
+  return dest
+end
+
+function Base.cat_t(dims::Integer, T::Type, x::KnetArray, xs::KnetArray...)
+  catdims = Base.dims2cat(dims)
+  shape = Base.cat_shape(catdims, (), size.((x, xs...))...)
+  dest = Base.cat_similar(x, T, shape)
+  _cat(dims, dest, x, xs...)
+end
+
+Base.vcat(xs::KnetArray...) = cat(xs..., dims=1)
+Base.hcat(xs::KnetArray...) = cat(xs..., dims=2)
 
 # Avoid using Base for unimplemented cat methods:
 
